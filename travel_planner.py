@@ -53,6 +53,27 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def validate_recommendation_schema(data: dict) -> list:
+    """
+    1차 추천 JSON이 필수 키를 갖췄는지 + 타입이 올바른지 검사한다.
+    문제가 없으면 빈 리스트, 있으면 문제 설명 리스트를 반환한다.
+    """
+    problems = []
+
+    for key in ("recommended_city", "weather", "reason"):
+        if key not in data:
+            problems.append(f"'{key}' 키 누락")
+        elif not isinstance(data[key], str) or not data[key].strip():
+            problems.append(f"'{key}'는 비어있지 않은 문자열이어야 함")
+
+    if "events" not in data:
+        problems.append("'events' 키 누락")
+    elif not isinstance(data["events"], list):
+        problems.append("'events'는 리스트(list) 형태여야 함")
+
+    return problems
+
+
 def validate_date(date_str: str) -> str:
     """YYYY-MM-DD 형식인지 검증. 형식이 틀리면 사용법을 출력하고 종료."""
     try:
@@ -133,7 +154,8 @@ def call_openai(api_key: str, system_prompt: str, user_prompt: str) -> str:
 def get_recommendation(api_key: str, date_str: str, errors: list) -> dict:
     """
     1차 추천 JSON을 생성한다.
-    파싱 실패 시 "필수 키만 다시 JSON으로 출력"하도록 프롬프트를 수정해 1회 재시도.
+    파싱 실패(또는 스키마 검증 실패) 시 "필수 키만 다시 JSON으로 출력"하도록
+    프롬프트를 수정해 1회 재시도.
     """
     system_prompt = (
         "너는 국내 여행 추천 도우미다. 사용자가 제공한 날짜를 기준으로 "
@@ -151,9 +173,9 @@ def get_recommendation(api_key: str, date_str: str, errors: list) -> dict:
     def _try_once(sys_p: str, usr_p: str) -> dict:
         raw_text = call_openai(api_key, sys_p, usr_p)
         parsed = extract_json_from_text(raw_text)
-        missing = [k for k in REQUIRED_KEYS_STEP1 if k not in parsed]
-        if missing:
-            raise ValueError(f"필수 키 누락: {missing}")
+        problems = validate_recommendation_schema(parsed)
+        if problems:
+            raise ValueError(f"스키마 검증 실패: {problems}")
         return parsed
 
     try:
@@ -164,13 +186,15 @@ def get_recommendation(api_key: str, date_str: str, errors: list) -> dict:
             "type": "PARSE_ERROR_RETRY",
             "message": str(e1),
         })
-        log("    - 1차 추천 JSON 파싱 실패, 재시도 중...")
+        log("    - 1차 추천 JSON 검증 실패, 재시도 중...")
         try:
             retry_system_prompt = (
                 system_prompt
-                + "\n\n[중요] 이전 응답이 JSON 파싱에 실패했다. "
-                  "이번에는 반드시 필수 키(recommended_city, weather, events, reason)만 "
-                  "포함한 순수 JSON 객체 하나만 출력하라. 코드블록이나 설명 문장을 절대 넣지 마라."
+                + "\n\n[중요] 이전 응답이 검증에 실패했다(키 누락 또는 타입 불일치 가능). "
+                  "이번에는 반드시 필수 키(recommended_city, weather, events, reason)를 "
+                  "모두 포함하고, recommended_city/weather/reason은 비어있지 않은 문자열, "
+                  "events는 리스트여야 한다. 순수 JSON 객체 하나만 출력하고 "
+                  "코드블록이나 설명 문장을 절대 넣지 마라."
             )
             return _try_once(retry_system_prompt, user_prompt)
         except (json.JSONDecodeError, ValueError, requests.RequestException) as e2:
@@ -182,7 +206,7 @@ def get_recommendation(api_key: str, date_str: str, errors: list) -> dict:
             # 재시도까지 실패하면 최소한의 기본값으로 다음 단계를 진행시킨다.
             return {
                 "recommended_city": "서울",
-                "weather": "정보 없음 (LLM 응답 파싱 실패)",
+                "weather": "정보 없음 (LLM 응답 파싱/검증 실패)",
                 "events": [],
                 "reason": "추천 정보를 생성하지 못했습니다.",
             }
